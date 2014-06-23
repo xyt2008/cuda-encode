@@ -16,6 +16,8 @@
 // with the CUDA H.264 Encoder, this define must also be present for drivers <= R260.
 //#define CUDA_FORCE_API_VERSION 3010
 
+
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <conio.h>
@@ -35,7 +37,7 @@
 #include <cudaGL.h>
 #include <builtin_types.h>
 #include <drvapi_error_string.h>
-#include <helper_string.h>
+#include <helper_string.h> 
 #include <helper_cuda_drvapi.h>
 #include <helper_timer.h>
 
@@ -43,18 +45,42 @@
 #include <opencv2\opencv.hpp>
 #include <opencv2\core\core.hpp>
 #include <opencv2\highgui\highgui.hpp>
-#include <opencv2\gpu\gpu.hpp>
 #include <opencv2\imgproc\imgproc.hpp>
 
+//include ffpmeg
+extern "C"
+{
+#include "libavcodec/avcodec.h"
+#include "libavformat/avformat.h"
+#include "libavformat/avio.h"
+#include "libavformat/version.h"
+#include "libavdevice/avdevice.h"
+#include "libswscale/swscale.h"
+};
+
+#pragma comment(lib, "avcodec.lib");
+#pragma comment(lib, "avformat.lib");
+#pragma comment(lib, "avdevice.lib");
+#pragma comment(lib, "swscale.lib");
 
 #include "VideoEncoder.h"
 
 using namespace std;
 using namespace cv;
 
+//#define APP_PORT 11311
+
 static char *sAppName     = "CUDA H.264 Encoder";
 static char *sAppFilename = "cudaEncode.exe";
 
+// Network variable define
+//static const char* sNetIP = "killua4b5.noip.me";
+static const char* sNetIP = "127.0.0.1";
+static const char* sNetPort = "49999";
+
+// FFMPEG
+AVFormatContext *avfmtCtx;
+AVStream		*stream;
 //////////////////////////////////
 // Global Variables Defined
 
@@ -70,9 +96,15 @@ double mse[3] = {0.0};
 #define VIDEO_CONFIG_FILE "704x480-h264.cfg"
 #define VIDEO_OUTPUT_FILE "plush_480p_60fr.264"
 
+
+// Queue frame
 std::_Mutex queue_mutex;
 std::queue<unsigned char*> queueFrame;
 bool bStopProc = false;
+
+
+// Network
+
 
 bool ParseInputParams(int argc, char *argv[], NVEncoderParams *pParams);
 
@@ -355,7 +387,22 @@ static void _stdcall HandleReleaseBitStream(int nBytesInBuffer, unsigned char *c
 
     if (pCudaEncoder && pCudaEncoder->fileOut())
     {
-        fwrite(cb,1,nBytesInBuffer,pCudaEncoder->fileOut());
+		//fwrite(cb,1,nBytesInBuffer,pCudaEncoder->fileOut());
+		AVPacket packet;
+		av_init_packet(&packet);
+
+		//memcpy(packet.data, cb, nBytesInBuffer);
+		packet.data = cb;
+		packet.size = nBytesInBuffer;
+		packet.stream_index = stream->index;
+		packet.flags = AV_PKT_FLAG_KEY;
+		//packet.pts = AV_NOPTS_VALUE;
+		//packet.dts = AV_NOPTS_VALUE;
+
+		int i = av_interleaved_write_frame(avfmtCtx, &packet);
+		//printf("send status: %d\n", i);
+
+		av_free_packet(&packet);
     }
 
     return;
@@ -431,6 +478,7 @@ void *pData = NULL;
 // This is our main application code
 int main(int argc, char *argv[])
 {
+	
 	// First we parse the input file (based on the command line parameters)
     // Set the input/output filenmaes
     if (!ParseInputParams(argc, argv, &sEncoderParams))
@@ -453,10 +501,49 @@ int main(int argc, char *argv[])
 
     CloseHandle(hwArr[0]);
 	CloseHandle(hwArr[1]);*/
+	av_register_all();
+	avdevice_register_all();
+	avcodec_register_all();
+	avformat_network_init();
+	
+	avfmtCtx = avformat_alloc_context();
+
+	AVOutputFormat *avOutputFmt = av_guess_format("rtp", NULL, NULL);
+	avfmtCtx->oformat = avOutputFmt;
+
+	sprintf(avfmtCtx->filename, "rtp://%s:%s", sNetIP, sNetPort);
+
+	if (avio_open(&avfmtCtx->pb, avfmtCtx->filename, AVIO_FLAG_WRITE) < 0)
+	{
+		printf("avio_open failed.\n");
+		return -1;
+	}
+
+	stream = av_new_stream(avfmtCtx, 1);
+	
+	AVCodecContext *codecCtx = stream->codec;
+	codecCtx->codec_id		= CODEC_ID_H264;
+	codecCtx->codec_type	= AVMEDIA_TYPE_VIDEO;
+	codecCtx->flags			= CODEC_FLAG_GLOBAL_HEADER;
+	codecCtx->width			= sEncoderParams.iInputSize[0];
+	codecCtx->height		= sEncoderParams.iInputSize[1];
+	codecCtx->delay			= 0;
+	codecCtx->time_base.den = 30;
+	codecCtx->time_base.num	= 1;
+	codecCtx->gop_size		= 30;
+	codecCtx->bit_rate		= 400000;
+	avfmtCtx->flags			= AVFMT_FLAG_MP4A_LATM;	//0x0040;
+	avfmtCtx->max_delay		= 0;
+	int avw = avformat_write_header(avfmtCtx, NULL);
+	
+	char *sdpbuff = new char[2048];
+	av_sdp_create(&avfmtCtx, 1, sdpbuff, 2048);
 
 	HANDLE hw = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)&ThreadEncode, NULL, 0, NULL);
 	WaitForSingleObject(hw, INFINITE);
 	CloseHandle(hw);
+
+	//avformat_free_context(avfmtCtx);
 }
 
 DWORD WINAPI ThreadEncode( LPVOID lpParam )
@@ -584,9 +671,11 @@ DWORD WINAPI ThreadEncode( LPVOID lpParam )
 
 		Mat srcframe, dstframe;
 		camera >> srcframe; // get a new frame from camera
-		cvtColor(srcframe, dstframe, CV_RGB2YUV_YV12);
 
-		size_t isize = strlen((char*)dstframe.data);
+		printf("convert..\n");
+		cvtColor(srcframe, dstframe, CV_RGB2YUV_YV12);
+		printf("end convert..\n");
+		//size_t isize = strlen((char*)dstframe.data);
 		//unsigned char* frBuff = (unsigned char*)(srcframe.data);
 		//size_t si = strlen((char*)frBuff);
 		//std::cout << si << std::endl;
